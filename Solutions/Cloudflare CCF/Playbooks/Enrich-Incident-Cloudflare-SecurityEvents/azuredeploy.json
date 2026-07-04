@@ -1,0 +1,422 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+    "contentVersion": "1.0.0.0",
+    "metadata": {
+        "title": "Enrich Incident - Cloudflare Security Events",
+        "description": "This playbook enriches a Microsoft Sentinel incident by querying the Cloudflare GraphQL Analytics API for recent firewall/WAF events tied to the incident's IP address(es), then posts the findings back to the incident as a comment. It is read-only and takes no blocking action.",
+        "mainSteps": [
+            "1. Extracts IP entities from the triggering Microsoft Sentinel incident.",
+            "2. For each IP address, queries the Cloudflare GraphQL Analytics API for firewall events (action, rule source, country, ASN, request path/query, user agent) in a configurable lookback window.",
+            "3. Adds a comment to the incident summarizing the firewall events found for each IP, giving analysts context before deciding whether to block, challenge, or dismiss."
+        ],
+        "prerequisites": [
+            "1. A Cloudflare API Token with 'Zone > Analytics > Read' permission scoped to the target zone. Create one under Cloudflare dashboard > My Profile > API Tokens.",
+            "2. The Cloudflare Zone ID for the domain to inspect, found on the zone's Overview page in the Cloudflare dashboard.",
+            "3. Analytic rules should be configured with IP entity mappings so incidents carry the IP address(es) to enrich (for example, the Cloudflare CCF analytic rules included in this solution)."
+        ],
+        "postDeployment": [
+            "**a. Authorize API connection**",
+            "Once deployment is complete, go under deployment details and authorize the Microsoft Sentinel connection.",
+            "1. Click the Microsoft Sentinel connection",
+            "2. Click **Edit API connection**",
+            "3. Sign in",
+            "4. Click Save",
+            "**b. Configurations in Sentinel**",
+            "- Configure an automation rule to trigger this playbook from the analytic rules that would benefit from extra Cloudflare context (for example, CloudflareCCFWafThreatAllowed, CloudflareCCFXSSProbingPattern, CloudflareCCFUnexpectedPost, CloudflareCCFUnexpectedRequest, CloudflareCCFUnexpectedUrl)."
+        ],
+        "lastUpdateTime": "2026-07-04T00:00:00.000Z",
+        "entities": [ "IP" ],
+        "tags": [ "Enrichment" ],
+        "support": {
+            "tier": "partner"
+        },
+        "author": {
+            "name": "Cloudflare"
+        },
+        "releaseNotes": [
+            {
+                "version": "1.0.0",
+                "title": "Enrich Incident - Cloudflare Security Events",
+                "notes": [ "Initial version" ]
+            }
+        ]
+    },
+    "parameters": {
+        "PlaybookName": {
+            "type": "string",
+            "defaultValue": "Enrich-Incident-Cloudflare-SecurityEvents",
+            "metadata": {
+                "description": "Enter name for the Enrich Incident - Cloudflare Security Events playbook without spaces"
+            },
+            "minLength": 3
+        },
+        "CloudflareZoneId": {
+            "type": "string",
+            "metadata": {
+                "description": "Enter the Cloudflare Zone ID (zoneTag) for the domain to inspect"
+            },
+            "minLength": 1
+        },
+        "CloudflareAPIToken": {
+            "type": "securestring",
+            "metadata": {
+                "description": "Enter the Cloudflare API Token with 'Zone > Analytics > Read' permission for the target zone"
+            }
+        },
+        "LookbackHours": {
+            "type": "int",
+            "defaultValue": 24,
+            "metadata": {
+                "description": "Number of hours of Cloudflare firewall event history to query for each IP address"
+            },
+            "minValue": 1
+        }
+    },
+    "variables": {
+        "AzureSentinel_Connection": "[concat('azuresentinel-', parameters('PlaybookName'))]"
+    },
+    "resources": [
+        {
+            "type": "Microsoft.Logic/workflows",
+            "apiVersion": "2017-07-01",
+            "name": "[parameters('PlaybookName')]",
+            "location": "[resourceGroup().location]",
+            "dependsOn": [
+                "[resourceId('Microsoft.Web/connections', variables('AzureSentinel_Connection'))]"
+            ],
+            "identity": {
+                "type": "SystemAssigned"
+            },
+            "properties": {
+                "state": "Enabled",
+                "definition": {
+                    "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+                    "contentVersion": "1.0.0.0",
+                    "parameters": {
+                        "$connections": {
+                            "defaultValue": {},
+                            "type": "Object"
+                        },
+                        "CloudflareZoneId": {
+                            "defaultValue": "[parameters('CloudflareZoneId')]",
+                            "type": "String"
+                        },
+                        "CloudflareAPIToken": {
+                            "defaultValue": "[parameters('CloudflareAPIToken')]",
+                            "type": "SecureString"
+                        },
+                        "LookbackHours": {
+                            "defaultValue": "[parameters('LookbackHours')]",
+                            "type": "Int"
+                        }
+                    },
+                    "triggers": {
+                        "When_Azure_Sentinel_incident_creation_rule_was_triggered": {
+                            "type": "ApiConnectionWebhook",
+                            "inputs": {
+                                "body": {
+                                    "callback_url": "@{listCallbackUrl()}"
+                                },
+                                "host": {
+                                    "connection": {
+                                        "name": "@parameters('$connections')['azuresentinel']['connectionId']"
+                                    }
+                                },
+                                "path": "/incident-creation"
+                            }
+                        }
+                    },
+                    "actions": {
+                        "Entities_-_Get_IPs": {
+                            "runAfter": {},
+                            "type": "ApiConnection",
+                            "inputs": {
+                                "body": "@triggerBody()?['object']?['properties']?['relatedEntities']",
+                                "host": {
+                                    "connection": {
+                                        "name": "@parameters('$connections')['azuresentinel']['connectionId']"
+                                    }
+                                },
+                                "method": "post",
+                                "path": "/entities/ip"
+                            }
+                        },
+                        "Initialize_ConsolidatedResults_variable": {
+                            "runAfter": {
+                                "Entities_-_Get_IPs": [ "Succeeded" ]
+                            },
+                            "type": "InitializeVariable",
+                            "inputs": {
+                                "variables": [
+                                    {
+                                        "name": "ConsolidatedResults",
+                                        "type": "array"
+                                    }
+                                ]
+                            },
+                            "description": "To store the Cloudflare firewall events found for each IP, for the incident comment table"
+                        },
+                        "Condition_-_Check_if_IP_entities_exist": {
+                            "runAfter": {
+                                "Initialize_ConsolidatedResults_variable": [ "Succeeded" ]
+                            },
+                            "type": "If",
+                            "expression": {
+                                "and": [
+                                    {
+                                        "greater": [
+                                            "@length(body('Entities_-_Get_IPs')?['IPs'])",
+                                            0
+                                        ]
+                                    }
+                                ]
+                            },
+                            "actions": {
+                                "For_each_IP_Address": {
+                                    "foreach": "@body('Entities_-_Get_IPs')?['IPs']",
+                                    "runAfter": {},
+                                    "type": "Foreach",
+                                    "description": "For each IP entity found on the incident",
+                                    "runtimeConfiguration": {
+                                        "concurrency": {
+                                            "repetitions": 1
+                                        }
+                                    },
+                                    "actions": {
+                                        "Query_Cloudflare_firewall_events": {
+                                            "runAfter": {},
+                                            "type": "Http",
+                                            "inputs": {
+                                                "method": "POST",
+                                                "uri": "https://api.cloudflare.com/client/v4/graphql",
+                                                "headers": {
+                                                    "Authorization": "Bearer @{parameters('CloudflareAPIToken')}",
+                                                    "Content-Type": "application/json"
+                                                },
+                                                "body": {
+                                                    "query": "query ListFirewallEvents($zoneTag: string, $filter: FirewallEventsAdaptiveFilter_InputObject) { viewer { zones(filter: {zoneTag: $zoneTag}) { firewallEventsAdaptive(filter: $filter, limit: 25, orderBy: [datetime_DESC]) { action clientAsn clientCountryName clientIP clientRequestPath clientRequestQuery datetime source userAgent } } } }",
+                                                    "variables": {
+                                                        "zoneTag": "@{parameters('CloudflareZoneId')}",
+                                                        "filter": {
+                                                            "clientIP": "@{items('For_each_IP_Address')?['Address']}",
+                                                            "datetime_geq": "@{addHours(utcNow(), mul(parameters('LookbackHours'), -1))}",
+                                                            "datetime_leq": "@{utcNow()}"
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        },
+                                        "Parse_Cloudflare_GraphQL_response": {
+                                            "runAfter": {
+                                                "Query_Cloudflare_firewall_events": [ "Succeeded", "Failed" ]
+                                            },
+                                            "type": "ParseJson",
+                                            "inputs": {
+                                                "content": "@body('Query_Cloudflare_firewall_events')",
+                                                "schema": {
+                                                    "type": "object",
+                                                    "properties": {
+                                                        "errors": { "type": [ "array", "null" ] },
+                                                        "data": {
+                                                            "type": [ "object", "null" ],
+                                                            "properties": {
+                                                                "viewer": {
+                                                                    "type": [ "object", "null" ],
+                                                                    "properties": {
+                                                                        "zones": {
+                                                                            "type": [ "array", "null" ],
+                                                                            "items": {
+                                                                                "type": "object",
+                                                                                "properties": {
+                                                                                    "firewallEventsAdaptive": {
+                                                                                        "type": "array",
+                                                                                        "items": {
+                                                                                            "type": "object",
+                                                                                            "properties": {
+                                                                                                "action": { "type": "string" },
+                                                                                                "clientAsn": { "type": [ "string", "integer", "null" ] },
+                                                                                                "clientCountryName": { "type": [ "string", "null" ] },
+                                                                                                "clientIP": { "type": "string" },
+                                                                                                "clientRequestPath": { "type": [ "string", "null" ] },
+                                                                                                "clientRequestQuery": { "type": [ "string", "null" ] },
+                                                                                                "datetime": { "type": "string" },
+                                                                                                "source": { "type": [ "string", "null" ] },
+                                                                                                "userAgent": { "type": [ "string", "null" ] }
+                                                                                            }
+                                                                                        }
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        },
+                                        "For_each_firewall_event": {
+                                            "foreach": "@coalesce(body('Parse_Cloudflare_GraphQL_response')?['data']?['viewer']?['zones']?[0]?['firewallEventsAdaptive'], createArray())",
+                                            "runAfter": {
+                                                "Parse_Cloudflare_GraphQL_response": [ "Succeeded" ]
+                                            },
+                                            "type": "Foreach",
+                                            "description": "For each Cloudflare firewall event found for this IP",
+                                            "actions": {
+                                                "Append_event_to_ConsolidatedResults": {
+                                                    "runAfter": {},
+                                                    "type": "AppendToArrayVariable",
+                                                    "inputs": {
+                                                        "name": "ConsolidatedResults",
+                                                        "value": {
+                                                            "IP Address": "@{items('For_each_IP_Address')?['Address']}",
+                                                            "Datetime": "@{items('For_each_firewall_event')?['datetime']}",
+                                                            "Action": "@{items('For_each_firewall_event')?['action']}",
+                                                            "Source": "@{items('For_each_firewall_event')?['source']}",
+                                                            "Country": "@{items('For_each_firewall_event')?['clientCountryName']}",
+                                                            "ASN": "@{items('For_each_firewall_event')?['clientAsn']}",
+                                                            "Request Path": "@{items('For_each_firewall_event')?['clientRequestPath']}",
+                                                            "User Agent": "@{items('For_each_firewall_event')?['userAgent']}"
+                                                        }
+                                                    },
+                                                    "description": "To append this firewall event to the incident comment table"
+                                                }
+                                            }
+                                        }
+                                    }
+                                },
+                                "Condition_-_Check_if_any_events_found": {
+                                    "runAfter": {
+                                        "For_each_IP_Address": [ "Succeeded" ]
+                                    },
+                                    "type": "If",
+                                    "expression": {
+                                        "and": [
+                                            {
+                                                "greater": [
+                                                    "@length(variables('ConsolidatedResults'))",
+                                                    0
+                                                ]
+                                            }
+                                        ]
+                                    },
+                                    "actions": {
+                                        "Create_incident_HTML_table": {
+                                            "runAfter": {},
+                                            "type": "Table",
+                                            "inputs": {
+                                                "columns": [
+                                                    { "header": "IP Address", "value": "@item()?['IP Address']" },
+                                                    { "header": "Datetime", "value": "@item()?['Datetime']" },
+                                                    { "header": "Action", "value": "@item()?['Action']" },
+                                                    { "header": "Source", "value": "@item()?['Source']" },
+                                                    { "header": "Country", "value": "@item()?['Country']" },
+                                                    { "header": "ASN", "value": "@item()?['ASN']" },
+                                                    { "header": "Request Path", "value": "@item()?['Request Path']" },
+                                                    { "header": "User Agent", "value": "@item()?['User Agent']" }
+                                                ],
+                                                "format": "HTML",
+                                                "from": "@variables('ConsolidatedResults')"
+                                            },
+                                            "description": "To build the incident comment table from the Cloudflare firewall events found"
+                                        },
+                                        "Add_comment_to_incident_-_events_found": {
+                                            "runAfter": {
+                                                "Create_incident_HTML_table": [ "Succeeded" ]
+                                            },
+                                            "type": "ApiConnection",
+                                            "inputs": {
+                                                "body": {
+                                                    "incidentArmId": "@triggerBody()?['object']?['id']",
+                                                    "message": "<p><strong>Cloudflare Security Event Enrichment</strong><br>\n<br>\nFound the following Cloudflare firewall events (last @{parameters('LookbackHours')} hour(s)) for the IP address(es) on this incident, zone <strong>@{parameters('CloudflareZoneId')}</strong>:<br>\n@{body('Create_incident_HTML_table')}</p>"
+                                                },
+                                                "host": {
+                                                    "connection": {
+                                                        "name": "@parameters('$connections')['azuresentinel']['connectionId']"
+                                                    }
+                                                },
+                                                "method": "post",
+                                                "path": "/Incidents/Comment"
+                                            }
+                                        }
+                                    },
+                                    "else": {
+                                        "actions": {
+                                            "Add_comment_to_incident_-_no_events_found": {
+                                                "runAfter": {},
+                                                "type": "ApiConnection",
+                                                "inputs": {
+                                                    "body": {
+                                                        "incidentArmId": "@triggerBody()?['object']?['id']",
+                                                        "message": "<p><strong>Cloudflare Security Event Enrichment</strong><br>\n<br>\nNo Cloudflare firewall events were found in the last @{parameters('LookbackHours')} hour(s) for the IP address(es) on this incident, zone <strong>@{parameters('CloudflareZoneId')}</strong>.</p>"
+                                                    },
+                                                    "host": {
+                                                        "connection": {
+                                                            "name": "@parameters('$connections')['azuresentinel']['connectionId']"
+                                                        }
+                                                    },
+                                                    "method": "post",
+                                                    "path": "/Incidents/Comment"
+                                                }
+                                            }
+                                        }
+                                    },
+                                    "description": "Condition to check if any Cloudflare firewall events were found across the incident's IP addresses"
+                                }
+                            },
+                            "else": {
+                                "actions": {
+                                    "Terminate_if_no_IP_found": {
+                                        "runAfter": {},
+                                        "type": "Terminate",
+                                        "inputs": {
+                                            "runError": {
+                                                "code": "404",
+                                                "message": "No IP address entities found on the Microsoft Sentinel incident."
+                                            },
+                                            "runStatus": "Failed"
+                                        }
+                                    }
+                                }
+                            },
+                            "description": "Condition to check if IP entities were found on the incident"
+                        }
+                    },
+                    "outputs": {}
+                },
+                "parameters": {
+                    "$connections": {
+                        "value": {
+                            "azuresentinel": {
+                                "connectionId": "[resourceId('Microsoft.Web/connections', variables('AzureSentinel_Connection'))]",
+                                "connectionName": "[variables('AzureSentinel_Connection')]",
+                                "id": "[concat('/subscriptions/',subscription().subscriptionId,'/providers/Microsoft.Web/locations/',resourceGroup().location,'/managedApis/azuresentinel')]",
+                                "connectionProperties": {
+                                    "authentication": {
+                                        "type": "ManagedServiceIdentity"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        {
+            "type": "MICROSOFT.WEB/CONNECTIONS",
+            "apiVersion": "2016-06-01",
+            "name": "[variables('AzureSentinel_Connection')]",
+            "kind": "V1",
+            "location": "[resourceGroup().location]",
+            "properties": {
+                "displayName": "[variables('AzureSentinel_Connection')]",
+                "customParameterValues": {},
+                "parameterValueType": "Alternative",
+                "api": {
+                    "id": "[concat('/subscriptions/',subscription().subscriptionId,'/providers/Microsoft.Web/locations/',resourceGroup().location,'/managedApis/azuresentinel')]"
+                }
+            }
+        }
+    ]
+}

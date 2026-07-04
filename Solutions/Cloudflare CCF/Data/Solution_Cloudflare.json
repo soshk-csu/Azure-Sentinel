@@ -36,9 +36,15 @@
     "Cloudflare CCF/Analytic Rules/CloudflareCCFWafThreatAllowed.yaml",
     "Cloudflare CCF/Analytic Rules/CloudflareCCFXSSProbingPattern.yaml"
   ],
+  "Playbooks": [
+    "Cloudflare CCF/Playbooks/Block-IP-Cloudflare/azuredeploy.json",
+    "Cloudflare CCF/Playbooks/Challenge-IP-Cloudflare/azuredeploy.json",
+    "Cloudflare CCF/Playbooks/Enrich-Incident-Cloudflare-SecurityEvents/azuredeploy.json",
+    "Cloudflare CCF/Playbooks/Notify-Teams-Cloudflare-HighSeverity/azuredeploy.json"
+  ],
   "Metadata": "SolutionMetadata.json",
   "BasePath": "C:\\GitHub\\Azure-Sentinel\\Solutions\\Cloudflare CCF",
-  "Version": "3.0.3",
+  "Version": "3.0.4",
   "TemplateSpec": true,
   "Is1PConnector": false
 }

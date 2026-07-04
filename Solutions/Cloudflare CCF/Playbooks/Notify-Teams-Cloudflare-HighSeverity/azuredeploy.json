@@ -1,0 +1,308 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+    "contentVersion": "1.0.0.0",
+    "metadata": {
+        "title": "Notify Teams - Cloudflare High Severity",
+        "description": "This playbook posts an adaptive card to a Microsoft Teams channel when a Microsoft Sentinel incident is created, summarizing the incident (title, severity, status, description, affected IP address(es), and a link to open it). Intended to be wired to high-severity Cloudflare CCF analytic rules (for example CloudflareCCFWafThreatAllowed) so on-call is notified immediately, independently of any blocking/challenge playbook.",
+        "mainSteps": [
+            "1. Extracts IP entities from the triggering Microsoft Sentinel incident.",
+            "2. Builds an adaptive card with the incident's title, severity, status, description, affected IP address(es), and a link to the incident.",
+            "3. Posts the card to the configured Microsoft Teams channel.",
+            "4. Adds a comment to the incident confirming the notification was sent."
+        ],
+        "prerequisites": [
+            "1. A Microsoft Teams Team ID and Channel ID for the channel notifications should be posted to. [Guidance to get IDs](https://learn.microsoft.com/microsoftteams/platform/webhooks-and-connectors/how-to/add-incoming-webhook)",
+            "2. Analytic rules should be configured with IP entity mappings, and scoped via an automation rule to the Cloudflare CCF rules that warrant immediate notification (for example CloudflareCCFWafThreatAllowed, which is High severity)."
+        ],
+        "postDeployment": [
+            "**a. Authorize API connections**",
+            "Once deployment is complete, go under deployment details and authorize both connections.",
+            "1. Click the Microsoft Sentinel connection, click **Edit API connection**, sign in, click Save.",
+            "2. Click the Microsoft Teams connection, click **Edit API connection**, sign in with an account that has access to the target Team, click Save.",
+            "**b. Configurations in Sentinel**",
+            "- Configure an automation rule to trigger this playbook from the Cloudflare CCF analytic rules that should page or notify the team, typically the higher-severity ones."
+        ],
+        "lastUpdateTime": "2026-07-04T00:00:00.000Z",
+        "entities": [ "IP" ],
+        "tags": [ "Notification" ],
+        "support": {
+            "tier": "partner"
+        },
+        "author": {
+            "name": "Cloudflare"
+        },
+        "releaseNotes": [
+            {
+                "version": "1.0.0",
+                "title": "Notify Teams - Cloudflare High Severity",
+                "notes": [ "Initial version" ]
+            }
+        ]
+    },
+    "parameters": {
+        "PlaybookName": {
+            "type": "string",
+            "defaultValue": "Notify-Teams-Cloudflare-HighSeverity",
+            "metadata": {
+                "description": "Enter name for the Notify Teams - Cloudflare High Severity playbook without spaces"
+            },
+            "minLength": 3
+        },
+        "TeamsTeamId": {
+            "type": "string",
+            "metadata": {
+                "description": "Enter the Microsoft Teams Team ID (group ID) that owns the target channel"
+            },
+            "minLength": 1
+        },
+        "TeamsChannelId": {
+            "type": "string",
+            "metadata": {
+                "description": "Enter the Microsoft Teams Channel ID to post notifications to"
+            },
+            "minLength": 1
+        }
+    },
+    "variables": {
+        "AzureSentinel_Connection": "[concat('azuresentinel-', parameters('PlaybookName'))]",
+        "Teams_Connection": "[concat('teams-', parameters('PlaybookName'))]"
+    },
+    "resources": [
+        {
+            "type": "Microsoft.Logic/workflows",
+            "apiVersion": "2017-07-01",
+            "name": "[parameters('PlaybookName')]",
+            "location": "[resourceGroup().location]",
+            "dependsOn": [
+                "[resourceId('Microsoft.Web/connections', variables('AzureSentinel_Connection'))]",
+                "[resourceId('Microsoft.Web/connections', variables('Teams_Connection'))]"
+            ],
+            "identity": {
+                "type": "SystemAssigned"
+            },
+            "properties": {
+                "state": "Enabled",
+                "definition": {
+                    "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+                    "contentVersion": "1.0.0.0",
+                    "parameters": {
+                        "$connections": {
+                            "defaultValue": {},
+                            "type": "Object"
+                        },
+                        "TeamsTeamId": {
+                            "defaultValue": "[parameters('TeamsTeamId')]",
+                            "type": "String"
+                        },
+                        "TeamsChannelId": {
+                            "defaultValue": "[parameters('TeamsChannelId')]",
+                            "type": "String"
+                        }
+                    },
+                    "triggers": {
+                        "When_Azure_Sentinel_incident_creation_rule_was_triggered": {
+                            "type": "ApiConnectionWebhook",
+                            "inputs": {
+                                "body": {
+                                    "callback_url": "@{listCallbackUrl()}"
+                                },
+                                "host": {
+                                    "connection": {
+                                        "name": "@parameters('$connections')['azuresentinel']['connectionId']"
+                                    }
+                                },
+                                "path": "/incident-creation"
+                            }
+                        }
+                    },
+                    "actions": {
+                        "Entities_-_Get_IPs": {
+                            "runAfter": {},
+                            "type": "ApiConnection",
+                            "inputs": {
+                                "body": "@triggerBody()?['object']?['properties']?['relatedEntities']",
+                                "host": {
+                                    "connection": {
+                                        "name": "@parameters('$connections')['azuresentinel']['connectionId']"
+                                    }
+                                },
+                                "method": "post",
+                                "path": "/entities/ip"
+                            }
+                        },
+                        "Select_IP_Addresses": {
+                            "runAfter": {
+                                "Entities_-_Get_IPs": [ "Succeeded" ]
+                            },
+                            "type": "Select",
+                            "inputs": {
+                                "from": "@body('Entities_-_Get_IPs')?['IPs']",
+                                "select": "@item()?['Address']"
+                            },
+                            "description": "To pull just the IP address strings out of the entity objects"
+                        },
+                        "Compose_-_IP_Address_List": {
+                            "runAfter": {
+                                "Select_IP_Addresses": [ "Succeeded" ]
+                            },
+                            "type": "Compose",
+                            "inputs": "@if(equals(length(body('Select_IP_Addresses')), 0), 'N/A', join(body('Select_IP_Addresses'), ', '))",
+                            "description": "To render the IP address list as a single string for the card"
+                        },
+                        "Compose_-_Teams_adaptive_card": {
+                            "runAfter": {
+                                "Compose_-_IP_Address_List": [ "Succeeded" ]
+                            },
+                            "type": "Compose",
+                            "inputs": {
+                                "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                                "type": "AdaptiveCard",
+                                "version": "1.4",
+                                "body": [
+                                    {
+                                        "type": "TextBlock",
+                                        "text": "Cloudflare Sentinel Incident",
+                                        "weight": "Bolder",
+                                        "size": "Medium"
+                                    },
+                                    {
+                                        "type": "TextBlock",
+                                        "text": "@{triggerBody()?['object']?['properties']?['title']}",
+                                        "wrap": true,
+                                        "weight": "Bolder"
+                                    },
+                                    {
+                                        "type": "TextBlock",
+                                        "text": "@{triggerBody()?['object']?['properties']?['description']}",
+                                        "wrap": true
+                                    },
+                                    {
+                                        "type": "FactSet",
+                                        "facts": [
+                                            {
+                                                "title": "Severity",
+                                                "value": "@{triggerBody()?['object']?['properties']?['severity']}"
+                                            },
+                                            {
+                                                "title": "Status",
+                                                "value": "@{triggerBody()?['object']?['properties']?['status']}"
+                                            },
+                                            {
+                                                "title": "IP Address(es)",
+                                                "value": "@{outputs('Compose_-_IP_Address_List')}"
+                                            },
+                                            {
+                                                "title": "Incident Number",
+                                                "value": "@{string(triggerBody()?['object']?['properties']?['incidentNumber'])}"
+                                            }
+                                        ]
+                                    }
+                                ],
+                                "actions": [
+                                    {
+                                        "type": "Action.OpenUrl",
+                                        "title": "Open Incident",
+                                        "url": "@{triggerBody()?['object']?['properties']?['incidentUrl']}"
+                                    }
+                                ]
+                            },
+                            "description": "To build the Teams adaptive card summarizing the incident"
+                        },
+                        "Post_adaptive_card_in_a_chat_or_channel": {
+                            "runAfter": {
+                                "Compose_-_Teams_adaptive_card": [ "Succeeded" ]
+                            },
+                            "type": "ApiConnection",
+                            "inputs": {
+                                "body": {
+                                    "messageBody": "@{outputs('Compose_-_Teams_adaptive_card')}",
+                                    "recipient": {
+                                        "channelId": "@parameters('TeamsChannelId')",
+                                        "groupId": "@parameters('TeamsTeamId')"
+                                    }
+                                },
+                                "host": {
+                                    "connection": {
+                                        "name": "@parameters('$connections')['teams']['connectionId']"
+                                    }
+                                },
+                                "method": "post",
+                                "path": "/v1.0/teams/conversation/adaptivecard/poster/Flow bot/location/@{encodeURIComponent('Channel')}"
+                            }
+                        },
+                        "Add_comment_to_incident": {
+                            "runAfter": {
+                                "Post_adaptive_card_in_a_chat_or_channel": [ "Succeeded" ]
+                            },
+                            "type": "ApiConnection",
+                            "inputs": {
+                                "body": {
+                                    "incidentArmId": "@triggerBody()?['object']?['id']",
+                                    "message": "<p><strong>Cloudflare Notify Teams Playbook</strong><br>\n<br>\nA notification for this incident was posted to the configured Microsoft Teams channel.</p>"
+                                },
+                                "host": {
+                                    "connection": {
+                                        "name": "@parameters('$connections')['azuresentinel']['connectionId']"
+                                    }
+                                },
+                                "method": "post",
+                                "path": "/Incidents/Comment"
+                            }
+                        }
+                    },
+                    "outputs": {}
+                },
+                "parameters": {
+                    "$connections": {
+                        "value": {
+                            "azuresentinel": {
+                                "connectionId": "[resourceId('Microsoft.Web/connections', variables('AzureSentinel_Connection'))]",
+                                "connectionName": "[variables('AzureSentinel_Connection')]",
+                                "id": "[concat('/subscriptions/',subscription().subscriptionId,'/providers/Microsoft.Web/locations/',resourceGroup().location,'/managedApis/azuresentinel')]",
+                                "connectionProperties": {
+                                    "authentication": {
+                                        "type": "ManagedServiceIdentity"
+                                    }
+                                }
+                            },
+                            "teams": {
+                                "connectionId": "[resourceId('Microsoft.Web/connections', variables('Teams_Connection'))]",
+                                "connectionName": "[variables('Teams_Connection')]",
+                                "id": "[concat('/subscriptions/',subscription().subscriptionId,'/providers/Microsoft.Web/locations/',resourceGroup().location,'/managedApis/Teams')]"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        {
+            "type": "MICROSOFT.WEB/CONNECTIONS",
+            "apiVersion": "2016-06-01",
+            "name": "[variables('AzureSentinel_Connection')]",
+            "kind": "V1",
+            "location": "[resourceGroup().location]",
+            "properties": {
+                "displayName": "[variables('AzureSentinel_Connection')]",
+                "customParameterValues": {},
+                "parameterValueType": "Alternative",
+                "api": {
+                    "id": "[concat('/subscriptions/',subscription().subscriptionId,'/providers/Microsoft.Web/locations/',resourceGroup().location,'/managedApis/azuresentinel')]"
+                }
+            }
+        },
+        {
+            "type": "Microsoft.Web/connections",
+            "apiVersion": "2016-06-01",
+            "name": "[variables('Teams_Connection')]",
+            "location": "[resourceGroup().location]",
+            "kind": "V1",
+            "properties": {
+                "displayName": "[variables('Teams_Connection')]",
+                "customParameterValues": {},
+                "api": {
+                    "id": "[concat('/subscriptions/',subscription().subscriptionId,'/providers/Microsoft.Web/locations/',resourceGroup().location,'/managedApis/Teams')]"
+                }
+            }
+        }
+    ]
+}

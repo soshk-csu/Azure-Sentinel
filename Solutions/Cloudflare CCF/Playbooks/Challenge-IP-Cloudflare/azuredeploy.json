@@ -1,0 +1,349 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+    "contentVersion": "1.0.0.0",
+    "metadata": {
+        "title": "Challenge IP - Cloudflare",
+        "description": "This playbook challenges the IP address(es) found on a Microsoft Sentinel incident by creating a Cloudflare IP Access Rule in challenge mode (managed_challenge, js_challenge, or legacy challenge) on the specified zone, then posts the results back to the incident as a comment. Intended for lower-confidence detections where an outright block risks false positives.",
+        "mainSteps": [
+            "1. Extracts IP entities from the triggering Microsoft Sentinel incident.",
+            "2. For each IP address, calls the Cloudflare API to create an IP Access Rule that challenges the address (instead of blocking it) on the configured zone.",
+            "3. Adds a comment to the incident summarizing which IP addresses were challenged."
+        ],
+        "prerequisites": [
+            "1. A Cloudflare API Token with 'Zone > Firewall Services > Edit' permission scoped to the target zone. Create one under Cloudflare dashboard > My Profile > API Tokens.",
+            "2. The Cloudflare Zone ID for the domain to protect, found on the zone's Overview page in the Cloudflare dashboard.",
+            "3. Analytic rules should be configured with IP entity mappings so incidents carry the IP address(es) to challenge. This playbook is best suited to noisy/lower-confidence rules where a hard block risks false positives, for example CloudflareCCFMultipleUAs, CloudflareCCFMultipleErrorsSource, CloudflareCCFEmptyUA, or CloudflareCCFUnexpectedCountry."
+        ],
+        "postDeployment": [
+            "**a. Authorize API connection**",
+            "Once deployment is complete, go under deployment details and authorize the Microsoft Sentinel connection.",
+            "1. Click the Microsoft Sentinel connection",
+            "2. Click **Edit API connection**",
+            "3. Sign in",
+            "4. Click Save",
+            "**b. Configurations in Sentinel**",
+            "- Configure an automation rule to trigger this playbook from the analytic rules that should result in an IP challenge rather than a hard block."
+        ],
+        "lastUpdateTime": "2026-07-04T00:00:00.000Z",
+        "entities": [ "IP" ],
+        "tags": [ "Remediation" ],
+        "support": {
+            "tier": "partner"
+        },
+        "author": {
+            "name": "Cloudflare"
+        },
+        "releaseNotes": [
+            {
+                "version": "1.0.0",
+                "title": "Challenge IP - Cloudflare",
+                "notes": [ "Initial version" ]
+            }
+        ]
+    },
+    "parameters": {
+        "PlaybookName": {
+            "type": "string",
+            "defaultValue": "Challenge-IP-Cloudflare",
+            "metadata": {
+                "description": "Enter name for the Challenge IP - Cloudflare playbook without spaces"
+            },
+            "minLength": 3
+        },
+        "CloudflareZoneId": {
+            "type": "string",
+            "metadata": {
+                "description": "Enter the Cloudflare Zone ID for the domain to protect"
+            },
+            "minLength": 1
+        },
+        "CloudflareAPIToken": {
+            "type": "securestring",
+            "metadata": {
+                "description": "Enter the Cloudflare API Token with 'Zone > Firewall Services > Edit' permission for the target zone"
+            }
+        },
+        "ChallengeMode": {
+            "type": "string",
+            "defaultValue": "managed_challenge",
+            "allowedValues": [ "managed_challenge", "js_challenge", "challenge" ],
+            "metadata": {
+                "description": "The Cloudflare IP Access Rule mode to apply: managed_challenge (recommended), js_challenge (legacy JS challenge), or challenge (legacy CAPTCHA)"
+            }
+        }
+    },
+    "variables": {
+        "AzureSentinel_Connection": "[concat('azuresentinel-', parameters('PlaybookName'))]"
+    },
+    "resources": [
+        {
+            "type": "Microsoft.Logic/workflows",
+            "apiVersion": "2017-07-01",
+            "name": "[parameters('PlaybookName')]",
+            "location": "[resourceGroup().location]",
+            "dependsOn": [
+                "[resourceId('Microsoft.Web/connections', variables('AzureSentinel_Connection'))]"
+            ],
+            "identity": {
+                "type": "SystemAssigned"
+            },
+            "properties": {
+                "state": "Enabled",
+                "definition": {
+                    "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+                    "contentVersion": "1.0.0.0",
+                    "parameters": {
+                        "$connections": {
+                            "defaultValue": {},
+                            "type": "Object"
+                        },
+                        "CloudflareZoneId": {
+                            "defaultValue": "[parameters('CloudflareZoneId')]",
+                            "type": "String"
+                        },
+                        "CloudflareAPIToken": {
+                            "defaultValue": "[parameters('CloudflareAPIToken')]",
+                            "type": "SecureString"
+                        },
+                        "ChallengeMode": {
+                            "defaultValue": "[parameters('ChallengeMode')]",
+                            "type": "String"
+                        }
+                    },
+                    "triggers": {
+                        "When_Azure_Sentinel_incident_creation_rule_was_triggered": {
+                            "type": "ApiConnectionWebhook",
+                            "inputs": {
+                                "body": {
+                                    "callback_url": "@{listCallbackUrl()}"
+                                },
+                                "host": {
+                                    "connection": {
+                                        "name": "@parameters('$connections')['azuresentinel']['connectionId']"
+                                    }
+                                },
+                                "path": "/incident-creation"
+                            }
+                        }
+                    },
+                    "actions": {
+                        "Entities_-_Get_IPs": {
+                            "runAfter": {},
+                            "type": "ApiConnection",
+                            "inputs": {
+                                "body": "@triggerBody()?['object']?['properties']?['relatedEntities']",
+                                "host": {
+                                    "connection": {
+                                        "name": "@parameters('$connections')['azuresentinel']['connectionId']"
+                                    }
+                                },
+                                "method": "post",
+                                "path": "/entities/ip"
+                            }
+                        },
+                        "Initialize_ConsolidatedResults_variable": {
+                            "runAfter": {
+                                "Entities_-_Get_IPs": [ "Succeeded" ]
+                            },
+                            "type": "InitializeVariable",
+                            "inputs": {
+                                "variables": [
+                                    {
+                                        "name": "ConsolidatedResults",
+                                        "type": "array"
+                                    }
+                                ]
+                            },
+                            "description": "To store per-IP challenge results for the incident comment table"
+                        },
+                        "Condition_-_Check_if_IP_entities_exist": {
+                            "runAfter": {
+                                "Initialize_ConsolidatedResults_variable": [ "Succeeded" ]
+                            },
+                            "type": "If",
+                            "expression": {
+                                "and": [
+                                    {
+                                        "greater": [
+                                            "@length(body('Entities_-_Get_IPs')?['IPs'])",
+                                            0
+                                        ]
+                                    }
+                                ]
+                            },
+                            "actions": {
+                                "For_each_IP_Address": {
+                                    "foreach": "@body('Entities_-_Get_IPs')?['IPs']",
+                                    "runAfter": {},
+                                    "type": "Foreach",
+                                    "description": "For each IP entity found on the incident",
+                                    "runtimeConfiguration": {
+                                        "concurrency": {
+                                            "repetitions": 1
+                                        }
+                                    },
+                                    "actions": {
+                                        "Challenge_IP_in_Cloudflare": {
+                                            "runAfter": {},
+                                            "type": "Http",
+                                            "inputs": {
+                                                "method": "POST",
+                                                "uri": "https://api.cloudflare.com/client/v4/zones/@{parameters('CloudflareZoneId')}/firewall/access_rules/rules",
+                                                "headers": {
+                                                    "Authorization": "Bearer @{parameters('CloudflareAPIToken')}",
+                                                    "Content-Type": "application/json"
+                                                },
+                                                "body": {
+                                                    "mode": "@{parameters('ChallengeMode')}",
+                                                    "configuration": {
+                                                        "target": "ip",
+                                                        "value": "@{items('For_each_IP_Address')?['Address']}"
+                                                    },
+                                                    "notes": "@{concat('Challenged automatically by Microsoft Sentinel - Incident: ', triggerBody()?['object']?['properties']?['title'])}"
+                                                }
+                                            }
+                                        },
+                                        "Parse_Cloudflare_response": {
+                                            "runAfter": {
+                                                "Challenge_IP_in_Cloudflare": [ "Succeeded", "Failed" ]
+                                            },
+                                            "type": "ParseJson",
+                                            "inputs": {
+                                                "content": "@body('Challenge_IP_in_Cloudflare')",
+                                                "schema": {
+                                                    "type": "object",
+                                                    "properties": {
+                                                        "success": { "type": "boolean" },
+                                                        "errors": { "type": "array" },
+                                                        "messages": { "type": "array" },
+                                                        "result": {
+                                                            "type": [ "object", "null" ],
+                                                            "properties": {
+                                                                "id": { "type": "string" },
+                                                                "notes": { "type": "string" },
+                                                                "mode": { "type": "string" },
+                                                                "configuration": {
+                                                                    "type": "object",
+                                                                    "properties": {
+                                                                        "target": { "type": "string" },
+                                                                        "value": { "type": "string" }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        },
+                                        "Append_result_to_ConsolidatedResults": {
+                                            "runAfter": {
+                                                "Parse_Cloudflare_response": [ "Succeeded" ]
+                                            },
+                                            "type": "AppendToArrayVariable",
+                                            "inputs": {
+                                                "name": "ConsolidatedResults",
+                                                "value": {
+                                                    "IP Address": "@{items('For_each_IP_Address')?['Address']}",
+                                                    "Challenged": "@{if(equals(body('Parse_Cloudflare_response')?['success'], true), 'Yes', 'No')}",
+                                                    "Mode": "@{parameters('ChallengeMode')}",
+                                                    "Rule ID": "@{coalesce(body('Parse_Cloudflare_response')?['result']?['id'], 'N/A')}",
+                                                    "Details": "@{if(equals(body('Parse_Cloudflare_response')?['success'], true), 'IP added to Cloudflare IP Access Rules (challenge)', string(body('Parse_Cloudflare_response')?['errors']))}"
+                                                }
+                                            },
+                                            "description": "To append the challenge result for this IP address"
+                                        }
+                                    }
+                                },
+                                "Create_incident_HTML_table": {
+                                    "runAfter": {
+                                        "For_each_IP_Address": [ "Succeeded" ]
+                                    },
+                                    "type": "Table",
+                                    "inputs": {
+                                        "columns": [
+                                            { "header": "IP Address", "value": "@item()?['IP Address']" },
+                                            { "header": "Challenged", "value": "@item()?['Challenged']" },
+                                            { "header": "Mode", "value": "@item()?['Mode']" },
+                                            { "header": "Rule ID", "value": "@item()?['Rule ID']" },
+                                            { "header": "Details", "value": "@item()?['Details']" }
+                                        ],
+                                        "format": "HTML",
+                                        "from": "@variables('ConsolidatedResults')"
+                                    },
+                                    "description": "To build the incident comment table from the challenge results"
+                                },
+                                "Add_comment_to_incident": {
+                                    "runAfter": {
+                                        "Create_incident_HTML_table": [ "Succeeded" ]
+                                    },
+                                    "type": "ApiConnection",
+                                    "inputs": {
+                                        "body": {
+                                            "incidentArmId": "@triggerBody()?['object']?['id']",
+                                            "message": "<p><strong>Cloudflare Challenge IP Playbook</strong><br>\n<br>\nThe following IP address(es) from this incident were submitted to Cloudflare zone <strong>@{parameters('CloudflareZoneId')}</strong> as IP Access Rules (@{parameters('ChallengeMode')}):<br>\n@{body('Create_incident_HTML_table')}</p>"
+                                        },
+                                        "host": {
+                                            "connection": {
+                                                "name": "@parameters('$connections')['azuresentinel']['connectionId']"
+                                            }
+                                        },
+                                        "method": "post",
+                                        "path": "/Incidents/Comment"
+                                    }
+                                }
+                            },
+                            "else": {
+                                "actions": {
+                                    "Terminate_if_no_IP_found": {
+                                        "runAfter": {},
+                                        "type": "Terminate",
+                                        "inputs": {
+                                            "runError": {
+                                                "code": "404",
+                                                "message": "No IP address entities found on the Microsoft Sentinel incident."
+                                            },
+                                            "runStatus": "Failed"
+                                        }
+                                    }
+                                }
+                            },
+                            "description": "Condition to check if IP entities were found on the incident"
+                        }
+                    },
+                    "outputs": {}
+                },
+                "parameters": {
+                    "$connections": {
+                        "value": {
+                            "azuresentinel": {
+                                "connectionId": "[resourceId('Microsoft.Web/connections', variables('AzureSentinel_Connection'))]",
+                                "connectionName": "[variables('AzureSentinel_Connection')]",
+                                "id": "[concat('/subscriptions/',subscription().subscriptionId,'/providers/Microsoft.Web/locations/',resourceGroup().location,'/managedApis/azuresentinel')]",
+                                "connectionProperties": {
+                                    "authentication": {
+                                        "type": "ManagedServiceIdentity"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        {
+            "type": "MICROSOFT.WEB/CONNECTIONS",
+            "apiVersion": "2016-06-01",
+            "name": "[variables('AzureSentinel_Connection')]",
+            "kind": "V1",
+            "location": "[resourceGroup().location]",
+            "properties": {
+                "displayName": "[variables('AzureSentinel_Connection')]",
+                "customParameterValues": {},
+                "parameterValueType": "Alternative",
+                "api": {
+                    "id": "[concat('/subscriptions/',subscription().subscriptionId,'/providers/Microsoft.Web/locations/',resourceGroup().location,'/managedApis/azuresentinel')]"
+                }
+            }
+        }
+    ]
+}
